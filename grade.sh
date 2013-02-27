@@ -52,45 +52,194 @@ runbochs () {
 }
 
 
-
-gmake
-runbochs
-
-score=0
-
-	echo_n "Printf: "
-	if grep "6828 decimal is 15254 octal!" bochs.out >/dev/null
+# Usage: runtest <tagname> <defs> <strings...>
+runtest () {
+	perl -e "print '$1: '"
+	rm -f obj/kern/init.o obj/kern/kernel obj/kern/bochs.img 
+	[ "$preservefs" = y ] || rm -f obj/fs/fs.img
+	if $verbose
 	then
-		score=`expr 20 + $score`
+		echo "gmake $2... "
+	fi
+	gmake $2 >$out
+	if [ $? -ne 0 ]
+	then
+		echo gmake $2 failed 
+		exit 1
+	fi
+	runbochs
+	if [ ! -s bochs.out ]
+	then
+		echo 'no bochs.out'
+	else
+		shift
+		shift
+		continuetest "$@"
+	fi
+}
+
+quicktest () {
+	perl -e "print '$1: '"
+	shift
+	continuetest "$@"
+}
+
+stubtest () {
+    perl -e "print qq|$1: OK $2\n|";
+    shift
+    score=`expr $pts + $score`
+}
+
+continuetest () {
+	okay=yes
+
+	not=false
+	for i
+	do
+		if [ "x$i" = "x!" ]
+		then
+			not=true
+		elif $not
+		then
+			if egrep "^$i\$" bochs.out >/dev/null
+			then
+				echo "got unexpected line '$i'"
+				if $verbose
+				then
+					exit 1
+				fi
+				okay=no
+			fi
+			not=false
+		else
+			egrep "^$i\$" bochs.out >/dev/null
+			if [ $? -ne 0 ]
+			then
+				echo "missing '$i'"
+				if $verbose
+				then
+					exit 1
+				fi
+				okay=no
+			fi
+			not=false
+		fi
+	done
+	if [ "$okay" = "yes" ]
+	then
+		score=`expr $pts + $score`
 		echo OK $time
 	else
 		echo WRONG $time
 	fi
+}
 
-	echo_n "Backtrace: "
-	args=`grep "ebp f01.* eip f0100.* args" bochs.out | awk '{ print $6 }'`
-	cnt=`echo $args | grep '^00000000 00000000 00000001 00000002 00000003 00000004 00000005' | wc -w`
-	if [ $cnt -eq 8 ]
+# Usage: runtest1 [-tag <tagname>] <progname> [-Ddef...] STRINGS...
+runtest1 () {
+	if [ $1 = -tag ]
 	then
-		score=`expr 15 + $score`
-		echo_n "Count OK"
+		shift
+		tag=$1
+		prog=$2
+		shift
+		shift
 	else
-		echo_n "Count WRONG"
+		tag=$1
+		prog=$1
+		shift
 	fi
+	runtest1_defs=
+	while expr "x$1" : 'x-D.*' >/dev/null; do
+		runtest1_defs="DEFS+='$1' $runtest1_defs"
+		shift
+	done
+	runtest "$tag" "DEFS='-DTEST=_binary_obj_user_${prog}_start' DEFS+='-DTESTSIZE=_binary_obj_user_${prog}_size' $runtest1_defs" "$@"
+}
 
-	cnt=`grep "ebp f01.* eip f0100.* args" bochs.out | awk 'BEGIN { FS = ORS = " " }
-{ print $6 }
-END { printf("\n") }' | grep '^00000000 00000000 00000001 00000002 00000003 00000004 00000005' | wc -w`
-	if [ $cnt -eq 8 ]; then
-		score=`expr 15 + $score`
-		echo , Args OK $time
-	else
-		echo , Args WRONG "($args)" $time
-	fi
 
-echo "Score: $score/50"
+score=0
 
-if [ $score -lt 50 ]; then
+# Reset the file system to its original, pristine state
+resetfs() {
+	rm -f obj/fs/fs.img
+	gmake obj/fs/fs.img >$out
+}
+
+
+resetfs
+
+runtest1 -tag 'fs i/o [testfsipc]' testfsipc \
+	'FS can do I/O' \
+	! 'idle loop can do I/O' \
+
+quicktest 'read_block [testfsipc]' \
+	'superblock is good' \
+
+quicktest 'write_block [testfsipc]' \
+	'write_block is good' \
+
+quicktest 'read_bitmap [testfsipc]' \
+	'read_bitmap is good' \
+
+quicktest 'alloc_block [testfsipc]' \
+	'alloc_block is good' \
+
+quicktest 'file_open [testfsipc]' \
+	'file_open is good' \
+
+quicktest 'file_get_block [testfsipc]' \
+	'file_get_block is good' \
+
+quicktest 'file_truncate [testfsipc]' \
+	'file_truncate is good' \
+
+quicktest 'file_flush [testfsipc]' \
+	'file_flush is good' \
+
+quicktest 'file rewrite [testfsipc]' \
+	'file rewrite is good' \
+
+quicktest 'serv_* [testfsipc]' \
+	'serve_open is good' \
+	'serve_map is good' \
+	'serve_close is good' \
+	'stale fileid is good' \
+
+echo PART A SCORE: $score/55
+
+partascore=$score
+
+score=0
+pts=10
+runtest1 -tag 'motd display [writemotd]' writemotd \
+	'OLD MOTD' \
+	'This is /motd, the message of the day.' \
+	'NEW MOTD' \
+	'This is the NEW message of the day!' \
+
+preservefs=y
+runtest1 -tag 'motd change [writemotd]' writemotd \
+	'OLD MOTD' \
+	'This is the NEW message of the day!' \
+	'NEW MOTD' \
+	! 'This is /motd, the message of the day.' \
+
+pts=25
+preservefs=n
+runtest1 -tag 'spawn via icode [icode]' icode \
+	'icode: read /motd' \
+	'This is /motd, the message of the day.' \
+	'icode: spawn /init' \
+	'init: running' \
+	'init: data seems okay' \
+	'icode: exiting' \
+	'init: bss seems okay' \
+	"init: args: 'init' 'initarg1' 'initarg2'" \
+	'init: exiting' \
+
+echo PART B SCORE: $score/45
+
+if [ $partascore -lt 55 -o $score -lt 45 ]; then
     exit 1
 fi
 
